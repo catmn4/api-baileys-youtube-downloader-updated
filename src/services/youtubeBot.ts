@@ -1,10 +1,8 @@
-import { spawnSync } from "node:child_process";
-import { existsSync, readFileSync, readlinkSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { mkdir, readdir, rm, stat } from "node:fs/promises";
-import { basename, delimiter, join, resolve } from "node:path";
+import { join, resolve } from "node:path";
 import type { AnyMessageContent, WAMessage } from "@whiskeysockets/baileys";
 import type { BaileysConnection } from "@/baileys/connection";
-import logger from "@/lib/logger";
 
 interface Format {
   format_id: string;
@@ -29,281 +27,10 @@ const workDir = resolve(process.env.YOUTUBE_OUTPUT_DIR?.trim() || join(root, "yo
 const cookiesPath = process.env.YOUTUBE_COOKIES_FILE?.trim()
   ? resolve(process.env.YOUTUBE_COOKIES_FILE.trim())
   : "";
-function findNode20Runtime(): string | undefined {
-  const configuredPath = process.env.YTDLP_NODE_PATH?.trim();
-  const binaryName = process.platform === "win32" ? "node.exe" : "node";
-  const candidates = configuredPath
-    ? [resolve(configuredPath)]
-    : (process.env.PATH ?? "")
-        .split(delimiter)
-        .filter(Boolean)
-        .map((directory) => join(directory, binaryName));
-  const checked = new Set<string>();
-  for (const candidate of candidates) {
-    const absolutePath = resolve(candidate);
-    if (checked.has(absolutePath) || !existsSync(absolutePath)) continue;
-    checked.add(absolutePath);
-    try {
-      const result = spawnSync(absolutePath, ["--version"], {
-        encoding: "utf8",
-        timeout: 2_000,
-      });
-      const major = Number(
-        String(result.stdout ?? "")
-          .trim()
-          .match(/^v?(\d+)/)?.[1] ?? 0,
-      );
-      if (result.status === 0 && major >= 20) return absolutePath;
-    } catch {
-      // Ignore unavailable or unsupported Node executables and try the next one.
-    }
-  }
-  return undefined;
-}
-
-const configuredJsRuntime = process.env.YOUTUBE_JS_RUNTIME?.trim().toLowerCase();
-const detectedNodeRuntime = findNode20Runtime();
-const appNodeMajor = process.versions.bun ? 0 : Number(process.versions.node?.split(".")[0] ?? 0);
-const nodeRuntimePath = detectedNodeRuntime ?? (appNodeMajor >= 20 ? process.execPath : undefined);
-const jsRuntime =
-  configuredJsRuntime === "bun"
-    ? "bun"
-    : configuredJsRuntime === "node" || nodeRuntimePath
-      ? "node"
-      : process.versions.bun
-        ? "bun"
-        : "node";
-const jsRuntimePath =
-  jsRuntime === "bun"
-    ? process.versions.bun
-      ? process.execPath
-      : "bun"
-    : (nodeRuntimePath ?? process.env.YTDLP_NODE_PATH?.trim() ?? "node");
-const jsRuntimeArgs = ["--js-runtimes", `${jsRuntime}:${jsRuntimePath}`];
+const jsRuntime = process.versions.bun ? "bun" : "node";
+const jsRuntimeArgs = ["--js-runtimes", `${jsRuntime}:${process.execPath}`];
 const activeJobs = new Set<string>();
 let diskUploadTail = Promise.resolve();
-let ytDlpQueueTail = Promise.resolve();
-const memoryLogIntervalMs = 1_000;
-
-function readCgroupBytes(paths: string[]): number | undefined {
-  for (const path of paths) {
-    try {
-      const value = readFileSync(path, "utf8").trim();
-      const bytes = Number(value);
-      if (Number.isFinite(bytes) && bytes > 0 && bytes < 1e15) return bytes;
-    } catch {
-      // cgroup memory counters are not available on every host.
-    }
-  }
-  return undefined;
-}
-
-function readCgroupStats(): Map<string, number> {
-  for (const path of ["/sys/fs/cgroup/memory.stat", "/sys/fs/cgroup/memory/memory.stat"]) {
-    try {
-      const stats = new Map<string, number>();
-      for (const line of readFileSync(path, "utf8").split(/\r?\n/)) {
-        const [key, value] = line.trim().split(/\s+/, 2);
-        const bytes = Number(value);
-        if (key && Number.isFinite(bytes)) stats.set(key, bytes);
-      }
-      return stats;
-    } catch {
-      // cgroup memory breakdown is not exposed by every host.
-    }
-  }
-  return new Map();
-}
-
-function readProcessTreeMemory(rootPid?: number):
-  | {
-      processCount: number;
-      rssBytes: number;
-      pssBytes: number;
-      rootRssBytes: number;
-      processes: Array<{
-        pid: number;
-        parentPid?: number;
-        name: string;
-        executable?: string;
-        rssBytes: number;
-        pssBytes?: number;
-      }>;
-    }
-  | undefined {
-  if (!rootPid) return undefined;
-  const pending = [rootPid];
-  const seen = new Set<number>();
-  const processes: Array<{
-    pid: number;
-    parentPid?: number;
-    name: string;
-    executable?: string;
-    rssBytes: number;
-    pssBytes?: number;
-  }> = [];
-  while (pending.length && seen.size < 128) {
-    const pid = pending.shift();
-    if (!pid || seen.has(pid)) continue;
-    seen.add(pid);
-    try {
-      const status = readFileSync(`/proc/${pid}/status`, "utf8");
-      const rssKb = Number(status.match(/^VmRSS:\s+(\d+)\s+kB$/m)?.[1] ?? 0);
-      const parentPid = Number(status.match(/^PPid:\s+(\d+)$/m)?.[1] ?? 0) || undefined;
-      const name = readFileSync(`/proc/${pid}/comm`, "utf8").trim() || "unknown";
-      let executable: string | undefined;
-      try {
-        executable = basename(readlinkSync(`/proc/${pid}/exe`));
-      } catch {
-        // The executable link may be hidden or the process may be exiting.
-      }
-      let pssBytes: number | undefined;
-      try {
-        const smaps = readFileSync(`/proc/${pid}/smaps_rollup`, "utf8");
-        const pssKb = Number(smaps.match(/^Pss:\s+(\d+)\s+kB$/m)?.[1] ?? NaN);
-        if (Number.isFinite(pssKb)) pssBytes = pssKb * 1024;
-      } catch {
-        // PSS is optional; some containers restrict access to smaps_rollup.
-      }
-      processes.push({
-        pid,
-        parentPid,
-        name,
-        executable,
-        rssBytes: rssKb * 1024,
-        pssBytes,
-      });
-      const children = readFileSync(`/proc/${pid}/task/${pid}/children`, "utf8")
-        .trim()
-        .split(/\s+/)
-        .map(Number)
-        .filter((childPid) => Number.isInteger(childPid) && childPid > 0);
-      pending.push(...children);
-    } catch {
-      // The process may have exited or /proc may be hidden by the container.
-    }
-  }
-  return {
-    processCount: processes.length,
-    rssBytes: processes.reduce((total, process) => total + process.rssBytes, 0),
-    pssBytes: processes.reduce((total, process) => total + (process.pssBytes ?? 0), 0),
-    rootRssBytes: processes.find((process) => process.pid === rootPid)?.rssBytes ?? 0,
-    processes,
-  };
-}
-
-function classifyYtDlpEvent(line: string): string | undefined {
-  const text = line.toLowerCase();
-  if (/extracting url/.test(text)) return "extracting-url";
-  if (/downloading webpage/.test(text)) return "downloading-webpage";
-  if (/challenge|nsig|signature/.test(text)) return "javascript-challenge";
-  if (/client config/.test(text)) return "downloading-client-config";
-  if (/api json|player.*api/.test(text)) return "downloading-player-api";
-  if (/downloading.*player|player.*\.js/.test(text)) return "downloading-player-script";
-  if (/m3u8|manifest|dash/.test(text)) return "extracting-manifest";
-  if (/extracting.*format|available formats/.test(text)) return "extracting-formats";
-  if (/\[(youtube|youtube:tab|info)\]/.test(text)) return "extractor-activity";
-  if (/error|warning/.test(text)) return "warning-or-error";
-  return undefined;
-}
-
-async function captureYtDlpStderr(
-  stream: ReadableStream<Uint8Array>,
-  phase: string,
-  childPid: number,
-): Promise<string> {
-  const reader = stream.getReader();
-  const decoder = new TextDecoder();
-  let output = "";
-  let pending = "";
-  const logLine = (line: string) => {
-    const event = classifyYtDlpEvent(line);
-    if (event) logMemorySnapshot(`yt-dlp:${phase}:event:${event}`, {}, childPid);
-  };
-  while (true) {
-    const { done, value } = await reader.read();
-    const text = decoder.decode(value, { stream: !done });
-    output += text;
-    pending += text;
-    const lines = pending.split(/[\r\n]+/);
-    pending = lines.pop() ?? "";
-    for (const line of lines) logLine(line);
-    if (done) break;
-  }
-  if (pending) logLine(pending);
-  return output;
-}
-
-function toMiB(bytes: number | undefined): number | undefined {
-  return bytes === undefined ? undefined : Math.round((bytes / 1024 / 1024) * 10) / 10;
-}
-
-function logMemorySnapshot(
-  stage: string,
-  context: Record<string, unknown> = {},
-  monitoredPid?: number,
-): void {
-  const usage = process.memoryUsage();
-  const cgroupUsed = readCgroupBytes([
-    "/sys/fs/cgroup/memory.current",
-    "/sys/fs/cgroup/memory/memory.usage_in_bytes",
-  ]);
-  const cgroupLimit = readCgroupBytes([
-    "/sys/fs/cgroup/memory.max",
-    "/sys/fs/cgroup/memory/memory.limit_in_bytes",
-  ]);
-  const cgroupStats = readCgroupStats();
-  const processTree = readProcessTreeMemory(monitoredPid);
-  logger.info(
-    {
-      component: "youtube-download",
-      stage,
-      ...context,
-      monitoredPid,
-      monitoredProcessCount: processTree?.processCount,
-      ytDlpProcesses: processTree?.processes.map((process) => ({
-        pid: process.pid,
-        parentPid: process.parentPid,
-        name: process.name,
-        executable: process.executable,
-        rssMiB: toMiB(process.rssBytes),
-        pssMiB: toMiB(process.pssBytes),
-      })),
-      memoryMiB: {
-        processRss: toMiB(usage.rss),
-        processHeapUsed: toMiB(usage.heapUsed),
-        processHeapTotal: toMiB(usage.heapTotal),
-        processExternal: toMiB(usage.external),
-        processArrayBuffers: toMiB(usage.arrayBuffers),
-        containerUsed: toMiB(cgroupUsed),
-        containerLimit: toMiB(cgroupLimit),
-        containerAnon: toMiB(cgroupStats.get("anon") ?? cgroupStats.get("rss")),
-        containerFileCache: toMiB(cgroupStats.get("file") ?? cgroupStats.get("cache")),
-        containerKernel: toMiB(cgroupStats.get("kernel")),
-        ytDlpRootRss: toMiB(processTree?.rootRssBytes),
-        ytDlpTreeRss: toMiB(processTree?.rssBytes),
-        ytDlpTreePss: toMiB(processTree?.pssBytes),
-      },
-    },
-    "[YouTube RAM]",
-  );
-}
-
-async function acquireYtDlpSlot(phase: string): Promise<() => void> {
-  const queuedAt = Date.now();
-  const previous = ytDlpQueueTail;
-  let release = () => {};
-  ytDlpQueueTail = new Promise<void>((resolve) => {
-    release = resolve;
-  });
-  logMemorySnapshot(`yt-dlp:${phase}:queued`, { jsRuntime });
-  await previous;
-  logMemorySnapshot(`yt-dlp:${phase}:slot-acquired`, {
-    jsRuntime,
-    queueWaitMs: Date.now() - queuedAt,
-  });
-  return release;
-}
 
 function safeYouTubeUrl(raw: string): string | null {
   try {
@@ -327,55 +54,29 @@ function safeYouTubeUrl(raw: string): string | null {
 async function run(
   args: string[],
   timeoutMs = 15 * 60_000,
-  phase = "yt-dlp",
 ): Promise<{ code: number; stdout: string; stderr: string }> {
   if (cookiesPath && !existsSync(cookiesPath)) {
     throw new Error(`ملف cookies المحدد غير موجود: ${cookiesPath}`);
   }
-  const releaseSlot = await acquireYtDlpSlot(phase);
-  const ytDlpArgs = [...jsRuntimeArgs, ...(cookiesPath ? ["--cookies", cookiesPath] : []), ...args];
-  const startedAt = Date.now();
+  const ytDlpArgs = [
+    ...jsRuntimeArgs,
+    ...(cookiesPath ? ["--cookies", cookiesPath] : []),
+    ...args,
+  ];
+  const child = Bun.spawn([ytdlp, ...ytDlpArgs], {
+    stdout: "pipe",
+    stderr: "pipe",
+    env: process.env,
+  });
+  const timeout = setTimeout(() => child.kill("SIGKILL"), timeoutMs);
   try {
-    logMemorySnapshot(`yt-dlp:${phase}:start`, { jsRuntime });
-    const child = Bun.spawn([ytdlp, ...ytDlpArgs], {
-      stdout: "pipe",
-      stderr: "pipe",
-      env: process.env,
-    });
-    logMemorySnapshot(`yt-dlp:${phase}:spawned`, { childPid: child.pid, jsRuntime }, child.pid);
-    const memoryTimer = setInterval(() => {
-      logMemorySnapshot(
-        `yt-dlp:${phase}:running`,
-        {
-          elapsedSeconds: Math.round((Date.now() - startedAt) / 1000),
-        },
-        child.pid,
-      );
-    }, memoryLogIntervalMs);
-    const timeout = setTimeout(() => child.kill("SIGKILL"), timeoutMs);
-    try {
-      const [stdout, stderr] = await Promise.all([
-        new Response(child.stdout).text(),
-        captureYtDlpStderr(child.stderr, phase, child.pid),
-      ]);
-      const code = await child.exited;
-      logMemorySnapshot(
-        `yt-dlp:${phase}:complete`,
-        {
-          exitCode: code,
-          durationMs: Date.now() - startedAt,
-          jsRuntime,
-        },
-        child.pid,
-      );
-      return { code, stdout, stderr };
-    } finally {
-      clearInterval(memoryTimer);
-      clearTimeout(timeout);
-    }
+    const [stdout, stderr] = await Promise.all([
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+    ]);
+    return { code: await child.exited, stdout, stderr };
   } finally {
-    releaseSlot();
-    logMemorySnapshot(`yt-dlp:${phase}:slot-released`, { jsRuntime });
+    clearTimeout(timeout);
   }
 }
 
@@ -459,7 +160,6 @@ export async function handleYouTubeCommand(
       const result = await run(
         ["--dump-single-json", "--no-playlist", "--no-warnings", url],
         90_000,
-        "format-inspection",
       );
       if (result.code !== 0) throw new Error(result.stderr.trim() || "تعذّر جلب معلومات الفيديو.");
       const info = JSON.parse(result.stdout) as VideoInfo;
@@ -576,7 +276,6 @@ async function downloadAndSend(
     const refreshed = await run(
       ["--dump-single-json", "--no-playlist", "--no-warnings", cached.url],
       90_000,
-      "format-refresh",
     );
     if (refreshed.code !== 0)
       throw new Error(refreshed.stderr.trim().slice(-900) || "تعذر تحديث صيغ الفيديو والصوت.");
@@ -607,33 +306,19 @@ async function downloadAndSend(
     ): Promise<{ file: string; path: string }> => {
       const output = join(dir, `${prefix}-%(title).100B-%(id)s.%(ext)s`);
       const args = ["--no-playlist", "--no-warnings", "--no-progress", "--format"];
-      logMemorySnapshot(`file-download:${prefix}:start`, { formatId });
-      let result = await run(
-        [...args, formatId, "--output", output, cached.url],
-        15 * 60_000,
-        `${prefix}-download`,
-      );
+      let result = await run([...args, formatId, "--output", output, cached.url]);
       if (
         result.code !== 0 &&
         /requested format is not available|requested format not available/i.test(result.stderr)
       ) {
-        logMemorySnapshot(`file-download:${prefix}:fallback`, { fallbackSelector });
-        result = await run(
-          [...args, fallbackSelector, "--output", output, cached.url],
-          15 * 60_000,
-          `${prefix}-fallback-download`,
-        );
+        result = await run([...args, fallbackSelector, "--output", output, cached.url]);
       }
       if (result.code !== 0)
         throw new Error(result.stderr.trim().slice(-900) || `فشل تنزيل ${errorLabel}.`);
       const file = (await readdir(dir)).find((name) => name.startsWith(`${prefix}-`));
       if (!file) throw new Error(`اكتمل تنزيل ${errorLabel} لكن تعذر العثور على ملفه.`);
       const path = join(dir, file);
-      const sizeBytes = (await stat(path)).size;
-      logMemorySnapshot(`file-download:${prefix}:ready`, {
-        fileSizeMiB: toMiB(sizeBytes),
-      });
-      if (sizeBytes > 1_900_000_000)
+      if ((await stat(path)).size > 1_900_000_000)
         throw new Error(`حجم ملف ${errorLabel} أكبر من الحد الآمن للإرسال عبر واتساب.`);
       return { file, path };
     };
@@ -657,7 +342,6 @@ async function downloadAndSend(
       );
     } finally {
       await rm(videoAsset.path, { force: true }).catch(() => {});
-      logMemorySnapshot("file-cleanup:video:complete");
     }
 
     // Only after the video upload has completed and its local file is removed,
@@ -680,12 +364,10 @@ async function downloadAndSend(
         );
       } finally {
         await rm(audioAsset.path, { force: true }).catch(() => {});
-        logMemorySnapshot("file-cleanup:audio:complete");
       }
     }
   } finally {
     await rm(dir, { recursive: true, force: true }).catch(() => {});
-    logMemorySnapshot("youtube-job:cleanup-complete");
   }
 }
 
@@ -721,8 +403,7 @@ async function sendDownloadedFile(
     fileName: file,
     caption: `${caption} — ${bytesLabel(size)}`,
   };
-  logMemorySnapshot("baileys:media-ready", { fileSizeMiB: toMiB(size) });
-  await sendWithDiskBackedEncryption(connection, jid, content, quoted, size);
+  await sendWithDiskBackedEncryption(connection, jid, content, quoted);
 }
 
 async function sendWithDiskBackedEncryption(
@@ -730,12 +411,8 @@ async function sendWithDiskBackedEncryption(
   jid: string,
   content: AnyMessageContent,
   quoted: WAMessage,
-  fileSizeBytes: number,
 ): Promise<void> {
   await mkdir(workDir, { recursive: true });
-  logMemorySnapshot("baileys:waiting-for-upload-slot", {
-    fileSizeMiB: toMiB(fileSizeBytes),
-  });
   const previousUpload = diskUploadTail;
   let release = () => {};
   diskUploadTail = new Promise<void>((resolve) => {
@@ -744,34 +421,14 @@ async function sendWithDiskBackedEncryption(
   await previousUpload;
   const previousTmpDir = process.env.TMPDIR;
   process.env.TMPDIR = workDir;
-  const startedAt = Date.now();
-  logMemorySnapshot("baileys:encrypt-and-upload:start", {
-    fileSizeMiB: toMiB(fileSizeBytes),
-  });
-  const memoryTimer = setInterval(() => {
-    logMemorySnapshot("baileys:encrypt-and-upload:running", {
-      elapsedSeconds: Math.round((Date.now() - startedAt) / 1000),
-      fileSizeMiB: toMiB(fileSizeBytes),
-    });
-  }, memoryLogIntervalMs);
   try {
     // Baileys reads the on-disk source as a stream, writes the encrypted upload
     // artifact under TMPDIR, uploads it, then removes that encrypted temp file.
     await connection.sendMessage(jid, content, { quoted });
-    logMemorySnapshot("baileys:encrypt-and-upload:complete", {
-      durationMs: Date.now() - startedAt,
-    });
-  } catch (error) {
-    logMemorySnapshot("baileys:encrypt-and-upload:failed", {
-      durationMs: Date.now() - startedAt,
-    });
-    throw error;
   } finally {
-    clearInterval(memoryTimer);
     if (previousTmpDir === undefined) delete process.env.TMPDIR;
     else process.env.TMPDIR = previousTmpDir;
     release();
-    logMemorySnapshot("baileys:upload-slot-released");
   }
 }
 
