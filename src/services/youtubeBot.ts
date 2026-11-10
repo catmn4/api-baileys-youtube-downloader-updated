@@ -1,6 +1,6 @@
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, readlinkSync } from "node:fs";
 import { mkdir, readdir, rm, stat } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { basename, join, resolve } from "node:path";
 import type { AnyMessageContent, WAMessage } from "@whiskeysockets/baileys";
 import type { BaileysConnection } from "@/baileys/connection";
 import logger from "@/lib/logger";
@@ -68,13 +68,29 @@ function readProcessTreeMemory(rootPid?: number):
   | {
       processCount: number;
       rssBytes: number;
+      pssBytes: number;
       rootRssBytes: number;
+      processes: Array<{
+        pid: number;
+        parentPid?: number;
+        name: string;
+        executable?: string;
+        rssBytes: number;
+        pssBytes?: number;
+      }>;
     }
   | undefined {
   if (!rootPid) return undefined;
   const pending = [rootPid];
   const seen = new Set<number>();
-  const rssByPid = new Map<number, number>();
+  const processes: Array<{
+    pid: number;
+    parentPid?: number;
+    name: string;
+    executable?: string;
+    rssBytes: number;
+    pssBytes?: number;
+  }> = [];
   while (pending.length && seen.size < 128) {
     const pid = pending.shift();
     if (!pid || seen.has(pid)) continue;
@@ -82,7 +98,30 @@ function readProcessTreeMemory(rootPid?: number):
     try {
       const status = readFileSync(`/proc/${pid}/status`, "utf8");
       const rssKb = Number(status.match(/^VmRSS:\s+(\d+)\s+kB$/m)?.[1] ?? 0);
-      rssByPid.set(pid, rssKb * 1024);
+      const parentPid = Number(status.match(/^PPid:\s+(\d+)$/m)?.[1] ?? 0) || undefined;
+      const name = readFileSync(`/proc/${pid}/comm`, "utf8").trim() || "unknown";
+      let executable: string | undefined;
+      try {
+        executable = basename(readlinkSync(`/proc/${pid}/exe`));
+      } catch {
+        // The executable link may be hidden or the process may be exiting.
+      }
+      let pssBytes: number | undefined;
+      try {
+        const smaps = readFileSync(`/proc/${pid}/smaps_rollup`, "utf8");
+        const pssKb = Number(smaps.match(/^Pss:\s+(\d+)\s+kB$/m)?.[1] ?? NaN);
+        if (Number.isFinite(pssKb)) pssBytes = pssKb * 1024;
+      } catch {
+        // PSS is optional; some containers restrict access to smaps_rollup.
+      }
+      processes.push({
+        pid,
+        parentPid,
+        name,
+        executable,
+        rssBytes: rssKb * 1024,
+        pssBytes,
+      });
       const children = readFileSync(`/proc/${pid}/task/${pid}/children`, "utf8")
         .trim()
         .split(/\s+/)
@@ -94,9 +133,11 @@ function readProcessTreeMemory(rootPid?: number):
     }
   }
   return {
-    processCount: rssByPid.size,
-    rssBytes: [...rssByPid.values()].reduce((total, value) => total + value, 0),
-    rootRssBytes: rssByPid.get(rootPid) ?? 0,
+    processCount: processes.length,
+    rssBytes: processes.reduce((total, process) => total + process.rssBytes, 0),
+    pssBytes: processes.reduce((total, process) => total + (process.pssBytes ?? 0), 0),
+    rootRssBytes: processes.find((process) => process.pid === rootPid)?.rssBytes ?? 0,
+    processes,
   };
 }
 
@@ -169,6 +210,14 @@ function logMemorySnapshot(
       ...context,
       monitoredPid,
       monitoredProcessCount: processTree?.processCount,
+      ytDlpProcesses: processTree?.processes.map((process) => ({
+        pid: process.pid,
+        parentPid: process.parentPid,
+        name: process.name,
+        executable: process.executable,
+        rssMiB: toMiB(process.rssBytes),
+        pssMiB: toMiB(process.pssBytes),
+      })),
       memoryMiB: {
         processRss: toMiB(usage.rss),
         processHeapUsed: toMiB(usage.heapUsed),
@@ -182,6 +231,7 @@ function logMemorySnapshot(
         containerKernel: toMiB(cgroupStats.get("kernel")),
         ytDlpRootRss: toMiB(processTree?.rootRssBytes),
         ytDlpTreeRss: toMiB(processTree?.rssBytes),
+        ytDlpTreePss: toMiB(processTree?.pssBytes),
       },
     },
     "[YouTube RAM]",
