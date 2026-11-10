@@ -1,8 +1,9 @@
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { mkdir, readdir, rm, stat } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import type { AnyMessageContent, WAMessage } from "@whiskeysockets/baileys";
 import type { BaileysConnection } from "@/baileys/connection";
+import logger from "@/lib/logger";
 
 interface Format {
   format_id: string;
@@ -31,6 +32,53 @@ const jsRuntime = process.versions.bun ? "bun" : "node";
 const jsRuntimeArgs = ["--js-runtimes", `${jsRuntime}:${process.execPath}`];
 const activeJobs = new Set<string>();
 let diskUploadTail = Promise.resolve();
+const memoryLogIntervalMs = 5_000;
+
+function readCgroupBytes(paths: string[]): number | undefined {
+  for (const path of paths) {
+    try {
+      const value = readFileSync(path, "utf8").trim();
+      const bytes = Number(value);
+      if (Number.isFinite(bytes) && bytes > 0 && bytes < 1e15) return bytes;
+    } catch {
+      // cgroup memory counters are not available on every host.
+    }
+  }
+  return undefined;
+}
+
+function toMiB(bytes: number | undefined): number | undefined {
+  return bytes === undefined ? undefined : Math.round((bytes / 1024 / 1024) * 10) / 10;
+}
+
+function logMemorySnapshot(stage: string, context: Record<string, unknown> = {}): void {
+  const usage = process.memoryUsage();
+  const cgroupUsed = readCgroupBytes([
+    "/sys/fs/cgroup/memory.current",
+    "/sys/fs/cgroup/memory/memory.usage_in_bytes",
+  ]);
+  const cgroupLimit = readCgroupBytes([
+    "/sys/fs/cgroup/memory.max",
+    "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+  ]);
+  logger.info(
+    {
+      component: "youtube-download",
+      stage,
+      ...context,
+      memoryMiB: {
+        processRss: toMiB(usage.rss),
+        processHeapUsed: toMiB(usage.heapUsed),
+        processHeapTotal: toMiB(usage.heapTotal),
+        processExternal: toMiB(usage.external),
+        processArrayBuffers: toMiB(usage.arrayBuffers),
+        containerUsed: toMiB(cgroupUsed),
+        containerLimit: toMiB(cgroupLimit),
+      },
+    },
+    "[YouTube RAM]",
+  );
+}
 
 function safeYouTubeUrl(raw: string): string | null {
   try {
@@ -54,28 +102,38 @@ function safeYouTubeUrl(raw: string): string | null {
 async function run(
   args: string[],
   timeoutMs = 15 * 60_000,
+  phase = "yt-dlp",
 ): Promise<{ code: number; stdout: string; stderr: string }> {
   if (cookiesPath && !existsSync(cookiesPath)) {
     throw new Error(`ملف cookies المحدد غير موجود: ${cookiesPath}`);
   }
-  const ytDlpArgs = [
-    ...jsRuntimeArgs,
-    ...(cookiesPath ? ["--cookies", cookiesPath] : []),
-    ...args,
-  ];
+  const ytDlpArgs = [...jsRuntimeArgs, ...(cookiesPath ? ["--cookies", cookiesPath] : []), ...args];
+  const startedAt = Date.now();
+  logMemorySnapshot(`yt-dlp:${phase}:start`);
   const child = Bun.spawn([ytdlp, ...ytDlpArgs], {
     stdout: "pipe",
     stderr: "pipe",
     env: process.env,
   });
+  const memoryTimer = setInterval(() => {
+    logMemorySnapshot(`yt-dlp:${phase}:running`, {
+      elapsedSeconds: Math.round((Date.now() - startedAt) / 1000),
+    });
+  }, memoryLogIntervalMs);
   const timeout = setTimeout(() => child.kill("SIGKILL"), timeoutMs);
   try {
     const [stdout, stderr] = await Promise.all([
       new Response(child.stdout).text(),
       new Response(child.stderr).text(),
     ]);
-    return { code: await child.exited, stdout, stderr };
+    const code = await child.exited;
+    logMemorySnapshot(`yt-dlp:${phase}:complete`, {
+      exitCode: code,
+      durationMs: Date.now() - startedAt,
+    });
+    return { code, stdout, stderr };
   } finally {
+    clearInterval(memoryTimer);
     clearTimeout(timeout);
   }
 }
@@ -160,6 +218,7 @@ export async function handleYouTubeCommand(
       const result = await run(
         ["--dump-single-json", "--no-playlist", "--no-warnings", url],
         90_000,
+        "format-inspection",
       );
       if (result.code !== 0) throw new Error(result.stderr.trim() || "تعذّر جلب معلومات الفيديو.");
       const info = JSON.parse(result.stdout) as VideoInfo;
@@ -276,6 +335,7 @@ async function downloadAndSend(
     const refreshed = await run(
       ["--dump-single-json", "--no-playlist", "--no-warnings", cached.url],
       90_000,
+      "format-refresh",
     );
     if (refreshed.code !== 0)
       throw new Error(refreshed.stderr.trim().slice(-900) || "تعذر تحديث صيغ الفيديو والصوت.");
@@ -306,19 +366,33 @@ async function downloadAndSend(
     ): Promise<{ file: string; path: string }> => {
       const output = join(dir, `${prefix}-%(title).100B-%(id)s.%(ext)s`);
       const args = ["--no-playlist", "--no-warnings", "--no-progress", "--format"];
-      let result = await run([...args, formatId, "--output", output, cached.url]);
+      logMemorySnapshot(`file-download:${prefix}:start`, { formatId });
+      let result = await run(
+        [...args, formatId, "--output", output, cached.url],
+        15 * 60_000,
+        `${prefix}-download`,
+      );
       if (
         result.code !== 0 &&
         /requested format is not available|requested format not available/i.test(result.stderr)
       ) {
-        result = await run([...args, fallbackSelector, "--output", output, cached.url]);
+        logMemorySnapshot(`file-download:${prefix}:fallback`, { fallbackSelector });
+        result = await run(
+          [...args, fallbackSelector, "--output", output, cached.url],
+          15 * 60_000,
+          `${prefix}-fallback-download`,
+        );
       }
       if (result.code !== 0)
         throw new Error(result.stderr.trim().slice(-900) || `فشل تنزيل ${errorLabel}.`);
       const file = (await readdir(dir)).find((name) => name.startsWith(`${prefix}-`));
       if (!file) throw new Error(`اكتمل تنزيل ${errorLabel} لكن تعذر العثور على ملفه.`);
       const path = join(dir, file);
-      if ((await stat(path)).size > 1_900_000_000)
+      const sizeBytes = (await stat(path)).size;
+      logMemorySnapshot(`file-download:${prefix}:ready`, {
+        fileSizeMiB: toMiB(sizeBytes),
+      });
+      if (sizeBytes > 1_900_000_000)
         throw new Error(`حجم ملف ${errorLabel} أكبر من الحد الآمن للإرسال عبر واتساب.`);
       return { file, path };
     };
@@ -342,6 +416,7 @@ async function downloadAndSend(
       );
     } finally {
       await rm(videoAsset.path, { force: true }).catch(() => {});
+      logMemorySnapshot("file-cleanup:video:complete");
     }
 
     // Only after the video upload has completed and its local file is removed,
@@ -364,10 +439,12 @@ async function downloadAndSend(
         );
       } finally {
         await rm(audioAsset.path, { force: true }).catch(() => {});
+        logMemorySnapshot("file-cleanup:audio:complete");
       }
     }
   } finally {
     await rm(dir, { recursive: true, force: true }).catch(() => {});
+    logMemorySnapshot("youtube-job:cleanup-complete");
   }
 }
 
@@ -403,7 +480,8 @@ async function sendDownloadedFile(
     fileName: file,
     caption: `${caption} — ${bytesLabel(size)}`,
   };
-  await sendWithDiskBackedEncryption(connection, jid, content, quoted);
+  logMemorySnapshot("baileys:media-ready", { fileSizeMiB: toMiB(size) });
+  await sendWithDiskBackedEncryption(connection, jid, content, quoted, size);
 }
 
 async function sendWithDiskBackedEncryption(
@@ -411,8 +489,12 @@ async function sendWithDiskBackedEncryption(
   jid: string,
   content: AnyMessageContent,
   quoted: WAMessage,
+  fileSizeBytes: number,
 ): Promise<void> {
   await mkdir(workDir, { recursive: true });
+  logMemorySnapshot("baileys:waiting-for-upload-slot", {
+    fileSizeMiB: toMiB(fileSizeBytes),
+  });
   const previousUpload = diskUploadTail;
   let release = () => {};
   diskUploadTail = new Promise<void>((resolve) => {
@@ -421,14 +503,34 @@ async function sendWithDiskBackedEncryption(
   await previousUpload;
   const previousTmpDir = process.env.TMPDIR;
   process.env.TMPDIR = workDir;
+  const startedAt = Date.now();
+  logMemorySnapshot("baileys:encrypt-and-upload:start", {
+    fileSizeMiB: toMiB(fileSizeBytes),
+  });
+  const memoryTimer = setInterval(() => {
+    logMemorySnapshot("baileys:encrypt-and-upload:running", {
+      elapsedSeconds: Math.round((Date.now() - startedAt) / 1000),
+      fileSizeMiB: toMiB(fileSizeBytes),
+    });
+  }, memoryLogIntervalMs);
   try {
     // Baileys reads the on-disk source as a stream, writes the encrypted upload
     // artifact under TMPDIR, uploads it, then removes that encrypted temp file.
     await connection.sendMessage(jid, content, { quoted });
+    logMemorySnapshot("baileys:encrypt-and-upload:complete", {
+      durationMs: Date.now() - startedAt,
+    });
+  } catch (error) {
+    logMemorySnapshot("baileys:encrypt-and-upload:failed", {
+      durationMs: Date.now() - startedAt,
+    });
+    throw error;
   } finally {
+    clearInterval(memoryTimer);
     if (previousTmpDir === undefined) delete process.env.TMPDIR;
     else process.env.TMPDIR = previousTmpDir;
     release();
+    logMemorySnapshot("baileys:upload-slot-released");
   }
 }
 
