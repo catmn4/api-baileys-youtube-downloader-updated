@@ -32,7 +32,7 @@ const jsRuntime = process.versions.bun ? "bun" : "node";
 const jsRuntimeArgs = ["--js-runtimes", `${jsRuntime}:${process.execPath}`];
 const activeJobs = new Set<string>();
 let diskUploadTail = Promise.resolve();
-const memoryLogIntervalMs = 5_000;
+const memoryLogIntervalMs = 1_000;
 
 function readCgroupBytes(paths: string[]): number | undefined {
   for (const path of paths) {
@@ -47,11 +47,110 @@ function readCgroupBytes(paths: string[]): number | undefined {
   return undefined;
 }
 
+function readCgroupStats(): Map<string, number> {
+  for (const path of ["/sys/fs/cgroup/memory.stat", "/sys/fs/cgroup/memory/memory.stat"]) {
+    try {
+      const stats = new Map<string, number>();
+      for (const line of readFileSync(path, "utf8").split(/\r?\n/)) {
+        const [key, value] = line.trim().split(/\s+/, 2);
+        const bytes = Number(value);
+        if (key && Number.isFinite(bytes)) stats.set(key, bytes);
+      }
+      return stats;
+    } catch {
+      // cgroup memory breakdown is not exposed by every host.
+    }
+  }
+  return new Map();
+}
+
+function readProcessTreeMemory(rootPid?: number):
+  | {
+      processCount: number;
+      rssBytes: number;
+      rootRssBytes: number;
+    }
+  | undefined {
+  if (!rootPid) return undefined;
+  const pending = [rootPid];
+  const seen = new Set<number>();
+  const rssByPid = new Map<number, number>();
+  while (pending.length && seen.size < 128) {
+    const pid = pending.shift();
+    if (!pid || seen.has(pid)) continue;
+    seen.add(pid);
+    try {
+      const status = readFileSync(`/proc/${pid}/status`, "utf8");
+      const rssKb = Number(status.match(/^VmRSS:\s+(\d+)\s+kB$/m)?.[1] ?? 0);
+      rssByPid.set(pid, rssKb * 1024);
+      const children = readFileSync(`/proc/${pid}/task/${pid}/children`, "utf8")
+        .trim()
+        .split(/\s+/)
+        .map(Number)
+        .filter((childPid) => Number.isInteger(childPid) && childPid > 0);
+      pending.push(...children);
+    } catch {
+      // The process may have exited or /proc may be hidden by the container.
+    }
+  }
+  return {
+    processCount: rssByPid.size,
+    rssBytes: [...rssByPid.values()].reduce((total, value) => total + value, 0),
+    rootRssBytes: rssByPid.get(rootPid) ?? 0,
+  };
+}
+
+function classifyYtDlpEvent(line: string): string | undefined {
+  const text = line.toLowerCase();
+  if (/extracting url/.test(text)) return "extracting-url";
+  if (/downloading webpage/.test(text)) return "downloading-webpage";
+  if (/challenge|nsig|signature/.test(text)) return "javascript-challenge";
+  if (/client config/.test(text)) return "downloading-client-config";
+  if (/api json|player.*api/.test(text)) return "downloading-player-api";
+  if (/downloading.*player|player.*\.js/.test(text)) return "downloading-player-script";
+  if (/m3u8|manifest|dash/.test(text)) return "extracting-manifest";
+  if (/extracting.*format|available formats/.test(text)) return "extracting-formats";
+  if (/\[(youtube|youtube:tab|info)\]/.test(text)) return "extractor-activity";
+  if (/error|warning/.test(text)) return "warning-or-error";
+  return undefined;
+}
+
+async function captureYtDlpStderr(
+  stream: ReadableStream<Uint8Array>,
+  phase: string,
+  childPid: number,
+): Promise<string> {
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let output = "";
+  let pending = "";
+  const logLine = (line: string) => {
+    const event = classifyYtDlpEvent(line);
+    if (event) logMemorySnapshot(`yt-dlp:${phase}:event:${event}`, {}, childPid);
+  };
+  while (true) {
+    const { done, value } = await reader.read();
+    const text = decoder.decode(value, { stream: !done });
+    output += text;
+    pending += text;
+    const lines = pending.split(/[\r\n]+/);
+    pending = lines.pop() ?? "";
+    for (const line of lines) logLine(line);
+    if (done) break;
+  }
+  if (pending) logLine(pending);
+  return output;
+}
+
 function toMiB(bytes: number | undefined): number | undefined {
   return bytes === undefined ? undefined : Math.round((bytes / 1024 / 1024) * 10) / 10;
 }
 
-function logMemorySnapshot(stage: string, context: Record<string, unknown> = {}): void {
+function logMemorySnapshot(
+  stage: string,
+  context: Record<string, unknown> = {},
+  monitoredPid?: number,
+): void {
   const usage = process.memoryUsage();
   const cgroupUsed = readCgroupBytes([
     "/sys/fs/cgroup/memory.current",
@@ -61,11 +160,15 @@ function logMemorySnapshot(stage: string, context: Record<string, unknown> = {})
     "/sys/fs/cgroup/memory.max",
     "/sys/fs/cgroup/memory/memory.limit_in_bytes",
   ]);
+  const cgroupStats = readCgroupStats();
+  const processTree = readProcessTreeMemory(monitoredPid);
   logger.info(
     {
       component: "youtube-download",
       stage,
       ...context,
+      monitoredPid,
+      monitoredProcessCount: processTree?.processCount,
       memoryMiB: {
         processRss: toMiB(usage.rss),
         processHeapUsed: toMiB(usage.heapUsed),
@@ -74,6 +177,11 @@ function logMemorySnapshot(stage: string, context: Record<string, unknown> = {})
         processArrayBuffers: toMiB(usage.arrayBuffers),
         containerUsed: toMiB(cgroupUsed),
         containerLimit: toMiB(cgroupLimit),
+        containerAnon: toMiB(cgroupStats.get("anon") ?? cgroupStats.get("rss")),
+        containerFileCache: toMiB(cgroupStats.get("file") ?? cgroupStats.get("cache")),
+        containerKernel: toMiB(cgroupStats.get("kernel")),
+        ytDlpRootRss: toMiB(processTree?.rootRssBytes),
+        ytDlpTreeRss: toMiB(processTree?.rssBytes),
       },
     },
     "[YouTube RAM]",
@@ -115,22 +223,31 @@ async function run(
     stderr: "pipe",
     env: process.env,
   });
+  logMemorySnapshot(`yt-dlp:${phase}:spawned`, { childPid: child.pid }, child.pid);
   const memoryTimer = setInterval(() => {
-    logMemorySnapshot(`yt-dlp:${phase}:running`, {
-      elapsedSeconds: Math.round((Date.now() - startedAt) / 1000),
-    });
+    logMemorySnapshot(
+      `yt-dlp:${phase}:running`,
+      {
+        elapsedSeconds: Math.round((Date.now() - startedAt) / 1000),
+      },
+      child.pid,
+    );
   }, memoryLogIntervalMs);
   const timeout = setTimeout(() => child.kill("SIGKILL"), timeoutMs);
   try {
     const [stdout, stderr] = await Promise.all([
       new Response(child.stdout).text(),
-      new Response(child.stderr).text(),
+      captureYtDlpStderr(child.stderr, phase, child.pid),
     ]);
     const code = await child.exited;
-    logMemorySnapshot(`yt-dlp:${phase}:complete`, {
-      exitCode: code,
-      durationMs: Date.now() - startedAt,
-    });
+    logMemorySnapshot(
+      `yt-dlp:${phase}:complete`,
+      {
+        exitCode: code,
+        durationMs: Date.now() - startedAt,
+      },
+      child.pid,
+    );
     return { code, stdout, stderr };
   } finally {
     clearInterval(memoryTimer);
