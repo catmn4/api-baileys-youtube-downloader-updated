@@ -1,0 +1,56 @@
+{
+    "compilerOptions": {
+        "target": "ESNext",
+        "module": "ESNext",
+        "moduleResolution": "bundler",
+        "types": [
+            "bun-types"
+        ],
+        "esModuleInterop": true,
+        "forceConsistentCasingInFileNames": true,
+        "strict": true,
+        "skipLibCheck": true,
+        "noEmit": true,
+        "resolveJsonModule": true,
+        "allowImportingTsExtensions": true,
+        "declaration": true,
+        "declarationMap": true,
+        "sourceMap": true,
+        "paths": {
+            "@/*": [
+                "./src/*"
+            ],
+            "@/baileys/*": [
+                "./src/baileys/*"
+            ],
+            "@/routes/*": [
+                "./src/routes/*"
+            ],
+            "@/middleware/*": [
+                "./src/middleware/*"
+            ],
+            "@/services/*": [
+                "./src/services/*"
+            ],
+            "@/lib/*": [
+                "./src/lib/*"
+            ],
+            "@/utils/*": [
+                "./src/utils/*"
+            ],
+            "@/schemas/*": [
+                "./src/schemas/*"
+            ]
+        },
+        "outDir": "dist"
+    },
+    "include": [
+        "src/**/*.ts",
+        "tests/**/*.ts",
+        "scripts/**/*.ts"
+    ],
+    "exclude": [
+        "node_modules",
+        "dist"
+    ]
+}

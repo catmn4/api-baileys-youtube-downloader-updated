@@ -1,0 +1,452 @@
+﻿<!doctype html>
+<html lang="en" data-theme="light">
+	<head>
+		<meta charset="UTF-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+		<title>apiBaileysWA — Unofficial WhatsApp API</title>
+		<link rel="icon" type="image/png" href="/dashboard/favico.png" />
+		<meta
+			name="description"
+			content="Control panel for Baileys WhatsApp REST API"
+		/>
+		<link rel="preconnect" href="https://fonts.googleapis.com" />
+		<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+		<link
+			href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap"
+			rel="stylesheet"
+		/>
+		<link rel="stylesheet" href="/dashboard/css/styles.css" />
+		<link rel="stylesheet" href="/dashboard/css/utilities.css" />
+	</head>
+	<body>
+		<div id="app">
+			<!-- Auth Screen -->
+			<div id="auth-screen" class="auth-screen hidden">
+				<div class="auth-card">
+					<div class="auth-logo">
+						<svg aria-hidden="true"
+							width="48"
+							height="48"
+							viewBox="0 0 24 24"
+							fill="none"
+							stroke="currentColor"
+							stroke-width="1.5"
+						>
+							<path d="M3 21l1.65-3.8a9 9 0 1 1 3.4 2.9L3 21" />
+							<path
+								d="M9 10a.5.5 0 0 0 1 0V9a.5.5 0 0 0-1 0v1zm0 0a5 5 0 0 0 5 5h1a.5.5 0 0 0 0-1h-1a.5.5 0 0 0 0 1"
+							/>
+						</svg>
+						<div class="auth-brand">
+							<h1>apiBaileysWA</h1>
+							<p class="auth-tagline">Unofficial WhatsApp API</p>
+						</div>
+					</div>
+					<p class="auth-subtitle" id="auth-subtitle">
+						Sign in to your dashboard
+					</p>
+					<form id="auth-form">
+						<div class="form-group">
+							<label for="auth-username">Username</label>
+							<input
+								type="text"
+								id="auth-username"
+								placeholder="Enter username"
+								autocomplete="username"
+								required
+							/>
+						</div>
+						<div class="form-group">
+							<label for="auth-password">Password</label>
+							<div class="input-password-wrapper">
+								<input
+									type="password"
+									id="auth-password"
+									placeholder="Enter password"
+									autocomplete="current-password"
+									required
+								/>
+								<button type="button" class="password-toggle" data-target="auth-password" title="Show password">
+									<svg aria-hidden="true" class="eye-open" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+										<path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/>
+										<circle cx="12" cy="12" r="3"/>
+									</svg>
+									<svg aria-hidden="true" class="eye-closed is-hidden" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+										<path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/>
+										<line x1="1" y1="1" x2="23" y2="23"/>
+									</svg>
+								</button>
+							</div>
+						</div>
+						<button
+							type="submit"
+							class="btn btn-primary btn-full"
+							id="auth-submit"
+						>
+							<span>Sign In</span>
+						</button>
+						<p class="auth-toggle" id="auth-toggle-text"></p>
+					</form>
+				</div>
+			</div>
+
+			<!-- Main Dashboard -->
+			<div id="dashboard" class="dashboard hidden">
+				<!-- Sidebar -->
+				<aside class="sidebar" id="sidebar">
+					<div class="sidebar-header">
+						<svg aria-hidden="true"
+							width="28"
+							height="28"
+							viewBox="0 0 24 24"
+							fill="none"
+							stroke="currentColor"
+							stroke-width="1.5"
+						>
+							<path d="M3 21l1.65-3.8a9 9 0 1 1 3.4 2.9L3 21" />
+						</svg>
+						<div class="sidebar-brand">
+							<span class="sidebar-title">apiBaileysWA</span>
+							<span class="sidebar-meta">
+								<span class="sidebar-tagline">Unofficial WhatsApp API</span>
+								<span class="sidebar-sep">·</span>
+								<span class="sidebar-version" id="sidebar-version"></span>
+							</span>
+						</div>
+						<button type="button" class="sidebar-close" id="sidebar-close">
+							X
+						</button>
+					</div>
+					<nav class="sidebar-nav">
+						<a
+							href="#overview"
+							class="nav-item active"
+							data-page="overview"
+						>
+							<svg aria-hidden="true"
+								width="18"
+								height="18"
+								viewBox="0 0 24 24"
+								fill="none"
+								stroke="currentColor"
+								stroke-width="2"
+							>
+								<rect x="3" y="3" width="7" height="9" rx="1" />
+								<rect
+									x="14"
+									y="3"
+									width="7"
+									height="5"
+									rx="1"
+								/>
+								<rect
+									x="14"
+									y="12"
+									width="7"
+									height="9"
+									rx="1"
+								/>
+								<rect
+									x="3"
+									y="16"
+									width="7"
+									height="5"
+									rx="1"
+								/>
+							</svg>
+							<span>Overview</span>
+						</a>
+						<a
+							href="#sessions"
+							class="nav-item"
+							data-page="sessions"
+						>
+							<svg aria-hidden="true"
+								width="18"
+								height="18"
+								viewBox="0 0 24 24"
+								fill="none"
+								stroke="currentColor"
+								stroke-width="2"
+							>
+								<path
+									d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"
+								/>
+								<polyline points="10 17 15 12 10 7" />
+								<line x1="15" y1="12" x2="3" y2="12" />
+							</svg>
+							<span>Sessions</span>
+						</a>
+						<a
+							href="#chatrooms"
+							class="nav-item"
+							data-page="chatrooms"
+						>
+							<svg aria-hidden="true"
+								width="18"
+								height="18"
+								viewBox="0 0 24 24"
+								fill="none"
+								stroke="currentColor"
+								stroke-width="2"
+							>
+								<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
+								<circle cx="9" cy="10" r="1" />
+								<circle cx="14" cy="10" r="1" />
+								<circle cx="19" cy="10" r="1" />
+							</svg>
+							<span>Chat Rooms</span>
+						</a>
+						<a
+							href="#messaging"
+							class="nav-item"
+							data-page="messaging"
+						>
+							<svg aria-hidden="true"
+								width="18"
+								height="18"
+								viewBox="0 0 24 24"
+								fill="none"
+								stroke="currentColor"
+								stroke-width="2"
+							>
+								<path
+									d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"
+								/>
+							</svg>
+							<span>Messaging</span>
+						</a>
+						<a
+							href="#ai"
+							class="nav-item"
+							data-page="ai"
+						>
+							<svg aria-hidden="true"
+								width="18"
+								height="18"
+								viewBox="0 0 24 24"
+								fill="none"
+								stroke="currentColor"
+								stroke-width="2"
+							>
+								<rect x="4" y="8" width="16" height="10" rx="3" />
+								<path d="M12 4v4M9 13h.01M15 13h.01" />
+							</svg>
+							<span>AI &amp; Routing</span>
+						</a>
+						<a href="#api" class="nav-item" data-page="api">
+							<svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+								<path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4" />
+							</svg>
+							<span>REST API</span>
+						</a>
+						<a
+							href="#webhooks"
+							class="nav-item"
+							data-page="webhooks"
+						>
+							<svg aria-hidden="true"
+								width="18"
+								height="18"
+								viewBox="0 0 24 24"
+								fill="none"
+								stroke="currentColor"
+								stroke-width="2"
+							>
+								<path
+									d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"
+								/>
+								<path
+									d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"
+								/>
+							</svg>
+							<span>Webhooks</span>
+						</a>
+						<a href="#events" class="nav-item" data-page="events">
+							<svg aria-hidden="true"
+								width="18"
+								height="18"
+								viewBox="0 0 24 24"
+								fill="none"
+								stroke="currentColor"
+								stroke-width="2"
+							>
+								<polyline
+									points="22 12 18 12 15 21 9 3 6 12 2 12"
+								/>
+							</svg>
+							<span>Events</span>
+							<span
+								class="nav-badge is-hidden"
+								id="events-badge"
+								>0</span
+							>
+						</a>
+						<a
+							href="#settings"
+							class="nav-item"
+							data-page="settings"
+						>
+							<svg aria-hidden="true"
+								width="18"
+								height="18"
+								viewBox="0 0 24 24"
+								fill="none"
+								stroke="currentColor"
+								stroke-width="2"
+							>
+								<circle cx="12" cy="12" r="3" />
+								<path
+									d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"
+								/>
+							</svg>
+							<span>Settings</span>
+						</a>
+					</nav>
+					<div class="sidebar-footer">
+						<button
+							type="button"
+							class="theme-toggle"
+							id="theme-toggle"
+							title="Toggle theme"
+						>
+							<svg aria-hidden="true"
+								class="icon-sun"
+								width="18"
+								height="18"
+								viewBox="0 0 24 24"
+								fill="none"
+								stroke="currentColor"
+								stroke-width="2"
+							>
+								<circle cx="12" cy="12" r="5" />
+								<line x1="12" y1="1" x2="12" y2="3" />
+								<line x1="12" y1="21" x2="12" y2="23" />
+								<line x1="4.22" y1="4.22" x2="5.64" y2="5.64" />
+								<line
+									x1="18.36"
+									y1="18.36"
+									x2="19.78"
+									y2="19.78"
+								/>
+								<line x1="1" y1="12" x2="3" y2="12" />
+								<line x1="21" y1="12" x2="23" y2="12" />
+								<line
+									x1="4.22"
+									y1="19.78"
+									x2="5.64"
+									y2="18.36"
+								/>
+								<line
+									x1="18.36"
+									y1="5.64"
+									x2="19.78"
+									y2="4.22"
+								/>
+							</svg>
+							<svg aria-hidden="true"
+								class="icon-moon"
+								width="18"
+								height="18"
+								viewBox="0 0 24 24"
+								fill="none"
+								stroke="currentColor"
+								stroke-width="2"
+							>
+								<path
+									d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"
+								/>
+							</svg>
+						</button>
+						<button
+							type="button"
+							class="btn-logout"
+							id="btn-logout"
+							title="Logout"
+						>
+							<svg aria-hidden="true"
+								width="18"
+								height="18"
+								viewBox="0 0 24 24"
+								fill="none"
+								stroke="currentColor"
+								stroke-width="2"
+							>
+								<path
+									d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"
+								/>
+								<polyline points="16 17 21 12 16 7" />
+								<line x1="21" y1="12" x2="9" y2="12" />
+							</svg>
+						</button>
+					</div>
+				</aside>
+
+				<!-- Main Content -->
+				<main class="main-content">
+					<header class="topbar">
+						<button type="button" class="hamburger" id="hamburger">
+							<svg aria-hidden="true"
+								width="24"
+								height="24"
+								viewBox="0 0 24 24"
+								fill="none"
+								stroke="currentColor"
+								stroke-width="2"
+							>
+								<line x1="3" y1="12" x2="21" y2="12" />
+								<line x1="3" y1="6" x2="21" y2="6" />
+								<line x1="3" y1="18" x2="21" y2="18" />
+							</svg>
+						</button>
+						<h2 id="page-title">Overview</h2>
+						<div class="topbar-right">
+							<div class="user-badge" id="user-badge"></div>
+						</div>
+					</header>
+					<div class="page-content" id="page-content">
+						<!-- Pages rendered here by JS -->
+					</div>
+				</main>
+			</div>
+
+			<!-- Modal Container -->
+			<div class="modal-overlay hidden" id="modal-overlay">
+				<div class="modal" id="modal">
+					<div class="modal-header">
+						<h3 id="modal-title">Modal</h3>
+						<button type="button" class="modal-close" id="modal-close">X</button>
+					</div>
+					<div class="modal-body" id="modal-body"></div>
+				</div>
+			</div>
+
+			<!-- Toast Container -->
+			<div class="toast-container" id="toast-container"></div>
+		</div>
+
+		<script src="/dashboard/js/theme.js"></script>
+		<script
+			src="https://cdn.jsdelivr.net/npm/dompurify@3.4.17/dist/purify.min.js"
+			integrity="sha384-P0JNneQf81HOl9VwNXK76cQ9VMD6Nfsnepxb0cCOg8+UzEdzgPHAPV4wVQrvYQSx"
+			crossorigin="anonymous"
+		></script>
+		<script src="/dashboard/js/lib/dom.js"></script>
+		<script src="/dashboard/js/api.js"></script>
+		<script src="/dashboard/js/components/toast.js"></script>
+		<script src="/dashboard/js/components/modal.js"></script>
+		<script src="/dashboard/js/auth.js"></script>
+		<script src="/dashboard/js/pages/overview.js"></script>
+		<script src="/dashboard/js/pages/sessions.js"></script>
+		<script src="/dashboard/js/pages/messaging.js"></script>
+		<script src="/dashboard/js/lib/messageFormat.js"></script>
+		<script src="/dashboard/js/pages/chatRooms.js"></script>
+		<script src="/dashboard/js/pages/webhooks.js"></script>
+		<script src="/dashboard/js/pages/events.js"></script>
+		<script src="/dashboard/js/pages/ai.js"></script>
+		<script src="/dashboard/js/pages/api.js"></script>
+		<script src="/dashboard/js/pages/settings.js"></script>
+		<script src="/dashboard/js/app.js"></script>
+	</body>
+</html>
+

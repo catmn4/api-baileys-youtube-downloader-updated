@@ -1,0 +1,10 @@
+node_modules/
+dist/
+.env
+cookies.txt
+youtube-cookies.txt
+sessions/
+media/
+logs/
+*.log
+bun.lock
