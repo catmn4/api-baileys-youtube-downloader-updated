@@ -1,6 +1,7 @@
+import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync, readlinkSync } from "node:fs";
 import { mkdir, readdir, rm, stat } from "node:fs/promises";
-import { basename, join, resolve } from "node:path";
+import { basename, delimiter, join, resolve } from "node:path";
 import type { AnyMessageContent, WAMessage } from "@whiskeysockets/baileys";
 import type { BaileysConnection } from "@/baileys/connection";
 import logger from "@/lib/logger";
@@ -28,10 +29,60 @@ const workDir = resolve(process.env.YOUTUBE_OUTPUT_DIR?.trim() || join(root, "yo
 const cookiesPath = process.env.YOUTUBE_COOKIES_FILE?.trim()
   ? resolve(process.env.YOUTUBE_COOKIES_FILE.trim())
   : "";
-const jsRuntime = process.versions.bun ? "bun" : "node";
-const jsRuntimeArgs = ["--js-runtimes", `${jsRuntime}:${process.execPath}`];
+function findNode20Runtime(): string | undefined {
+  const configuredPath = process.env.YTDLP_NODE_PATH?.trim();
+  const binaryName = process.platform === "win32" ? "node.exe" : "node";
+  const candidates = configuredPath
+    ? [resolve(configuredPath)]
+    : (process.env.PATH ?? "")
+        .split(delimiter)
+        .filter(Boolean)
+        .map((directory) => join(directory, binaryName));
+  const checked = new Set<string>();
+  for (const candidate of candidates) {
+    const absolutePath = resolve(candidate);
+    if (checked.has(absolutePath) || !existsSync(absolutePath)) continue;
+    checked.add(absolutePath);
+    try {
+      const result = spawnSync(absolutePath, ["--version"], {
+        encoding: "utf8",
+        timeout: 2_000,
+      });
+      const major = Number(
+        String(result.stdout ?? "")
+          .trim()
+          .match(/^v?(\d+)/)?.[1] ?? 0,
+      );
+      if (result.status === 0 && major >= 20) return absolutePath;
+    } catch {
+      // Ignore unavailable or unsupported Node executables and try the next one.
+    }
+  }
+  return undefined;
+}
+
+const configuredJsRuntime = process.env.YOUTUBE_JS_RUNTIME?.trim().toLowerCase();
+const detectedNodeRuntime = findNode20Runtime();
+const appNodeMajor = process.versions.bun ? 0 : Number(process.versions.node?.split(".")[0] ?? 0);
+const nodeRuntimePath = detectedNodeRuntime ?? (appNodeMajor >= 20 ? process.execPath : undefined);
+const jsRuntime =
+  configuredJsRuntime === "bun"
+    ? "bun"
+    : configuredJsRuntime === "node" || nodeRuntimePath
+      ? "node"
+      : process.versions.bun
+        ? "bun"
+        : "node";
+const jsRuntimePath =
+  jsRuntime === "bun"
+    ? process.versions.bun
+      ? process.execPath
+      : "bun"
+    : (nodeRuntimePath ?? process.env.YTDLP_NODE_PATH?.trim() ?? "node");
+const jsRuntimeArgs = ["--js-runtimes", `${jsRuntime}:${jsRuntimePath}`];
 const activeJobs = new Set<string>();
 let diskUploadTail = Promise.resolve();
+let ytDlpQueueTail = Promise.resolve();
 const memoryLogIntervalMs = 1_000;
 
 function readCgroupBytes(paths: string[]): number | undefined {
@@ -238,6 +289,22 @@ function logMemorySnapshot(
   );
 }
 
+async function acquireYtDlpSlot(phase: string): Promise<() => void> {
+  const queuedAt = Date.now();
+  const previous = ytDlpQueueTail;
+  let release = () => {};
+  ytDlpQueueTail = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  logMemorySnapshot(`yt-dlp:${phase}:queued`, { jsRuntime });
+  await previous;
+  logMemorySnapshot(`yt-dlp:${phase}:slot-acquired`, {
+    jsRuntime,
+    queueWaitMs: Date.now() - queuedAt,
+  });
+  return release;
+}
+
 function safeYouTubeUrl(raw: string): string | null {
   try {
     const url = new URL(raw);
@@ -265,43 +332,50 @@ async function run(
   if (cookiesPath && !existsSync(cookiesPath)) {
     throw new Error(`ملف cookies المحدد غير موجود: ${cookiesPath}`);
   }
+  const releaseSlot = await acquireYtDlpSlot(phase);
   const ytDlpArgs = [...jsRuntimeArgs, ...(cookiesPath ? ["--cookies", cookiesPath] : []), ...args];
   const startedAt = Date.now();
-  logMemorySnapshot(`yt-dlp:${phase}:start`);
-  const child = Bun.spawn([ytdlp, ...ytDlpArgs], {
-    stdout: "pipe",
-    stderr: "pipe",
-    env: process.env,
-  });
-  logMemorySnapshot(`yt-dlp:${phase}:spawned`, { childPid: child.pid }, child.pid);
-  const memoryTimer = setInterval(() => {
-    logMemorySnapshot(
-      `yt-dlp:${phase}:running`,
-      {
-        elapsedSeconds: Math.round((Date.now() - startedAt) / 1000),
-      },
-      child.pid,
-    );
-  }, memoryLogIntervalMs);
-  const timeout = setTimeout(() => child.kill("SIGKILL"), timeoutMs);
   try {
-    const [stdout, stderr] = await Promise.all([
-      new Response(child.stdout).text(),
-      captureYtDlpStderr(child.stderr, phase, child.pid),
-    ]);
-    const code = await child.exited;
-    logMemorySnapshot(
-      `yt-dlp:${phase}:complete`,
-      {
-        exitCode: code,
-        durationMs: Date.now() - startedAt,
-      },
-      child.pid,
-    );
-    return { code, stdout, stderr };
+    logMemorySnapshot(`yt-dlp:${phase}:start`, { jsRuntime });
+    const child = Bun.spawn([ytdlp, ...ytDlpArgs], {
+      stdout: "pipe",
+      stderr: "pipe",
+      env: process.env,
+    });
+    logMemorySnapshot(`yt-dlp:${phase}:spawned`, { childPid: child.pid, jsRuntime }, child.pid);
+    const memoryTimer = setInterval(() => {
+      logMemorySnapshot(
+        `yt-dlp:${phase}:running`,
+        {
+          elapsedSeconds: Math.round((Date.now() - startedAt) / 1000),
+        },
+        child.pid,
+      );
+    }, memoryLogIntervalMs);
+    const timeout = setTimeout(() => child.kill("SIGKILL"), timeoutMs);
+    try {
+      const [stdout, stderr] = await Promise.all([
+        new Response(child.stdout).text(),
+        captureYtDlpStderr(child.stderr, phase, child.pid),
+      ]);
+      const code = await child.exited;
+      logMemorySnapshot(
+        `yt-dlp:${phase}:complete`,
+        {
+          exitCode: code,
+          durationMs: Date.now() - startedAt,
+          jsRuntime,
+        },
+        child.pid,
+      );
+      return { code, stdout, stderr };
+    } finally {
+      clearInterval(memoryTimer);
+      clearTimeout(timeout);
+    }
   } finally {
-    clearInterval(memoryTimer);
-    clearTimeout(timeout);
+    releaseSlot();
+    logMemorySnapshot(`yt-dlp:${phase}:slot-released`, { jsRuntime });
   }
 }
 
